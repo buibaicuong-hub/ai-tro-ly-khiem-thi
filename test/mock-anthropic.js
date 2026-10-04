@@ -10,6 +10,13 @@ export function startMockAnthropic() {
       const json = JSON.parse(body);
       requests.push({ headers: req.headers, body: json });
       const last = json.messages.at(-1);
+
+      // Kịch bản "NOSEARCH": giả lập API từ chối công cụ tìm kiếm web.
+      if (JSON.stringify(json.messages).includes("NOSEARCH") && json.tools) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "tools.0.web_search_20260209: not supported" } }));
+        return;
+      }
       const text = JSON.stringify(json.messages);
       res.writeHead(200, { "content-type": "text/event-stream" });
       const ev = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);

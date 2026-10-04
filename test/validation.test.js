@@ -38,12 +38,19 @@ test("cleanText cắt độ dài tối đa", () => {
   assert.equal(cleanText("   "), null);
 });
 
-test("withClock thêm system message ở cuối", () => {
-  const msgs = [{ role: "user", content: "hi" }];
+test("withClock thêm giờ vào lượt hỏi cuối", () => {
+  const msgs = [{ role: "assistant", content: "a" }, { role: "user", content: "hi" }];
   assert.equal(withClock(msgs, undefined), msgs);
   const out = withClock(msgs, "thứ hai");
-  assert.equal(out.at(-1).role, "system");
-  assert.match(out.at(-1).content, /thứ hai/);
+  assert.equal(out.length, 2);
+  assert.deepEqual(out[0], msgs[0]);
+  assert.equal(out[1].role, "user");
+  assert.equal(out[1].content[0].text, "hi");
+  assert.match(out[1].content[1].text, /thứ hai/);
+  assert.equal(msgs[1].content, "hi"); // không sửa mảng gốc
+
+  const withImage = [{ role: "user", content: [{ type: "image" }, { type: "text", text: "q" }] }];
+  assert.equal(withClock(withImage, "x")[0].content.length, 3);
 });
 
 test("parseDataUrl kiểm tra loại và kích thước ảnh", () => {
