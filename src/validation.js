@@ -34,12 +34,15 @@ export function sanitizeHistory(raw) {
   return messages;
 }
 
-// Thêm giờ địa phương của người dùng bằng một system message ở cuối hội thoại
-// (không sửa system prompt cố định để giữ nguyên bộ nhớ đệm prompt).
+// Thêm giờ địa phương của người dùng vào lượt hỏi cuối cùng (không sửa system prompt cố định
+// để giữ nguyên bộ nhớ đệm prompt; dùng khối văn bản thường để mô hình nào cũng hỗ trợ).
 export function withClock(messages, clientTime) {
   const time = cleanText(clientTime)?.slice(0, 100);
-  if (!time) return messages;
-  return [...messages, { role: "system", content: `Thời gian hiện tại trên thiết bị người dùng: ${time}.` }];
+  const last = messages[messages.length - 1];
+  if (!time || last?.role !== "user") return messages;
+  const content = typeof last.content === "string" ? [{ type: "text", text: last.content }] : last.content;
+  const clock = { type: "text", text: `(Thời gian hiện tại trên thiết bị người dùng: ${time}.)` };
+  return [...messages.slice(0, -1), { role: "user", content: [...content, clock] }];
 }
 
 /** Tách data URL ảnh thành { mediaType, data }; null nếu sai định dạng hoặc quá lớn. */

@@ -26,13 +26,18 @@ const ACCESS_CODE = process.env.APP_ACCESS_CODE || "";
 const MAX_CONTINUATIONS = 3; // số lần tiếp tục tối đa khi tìm kiếm web bị tạm dừng (pause_turn)
 
 const CHAT_SYSTEM_PROMPT = buildChatSystemPrompt({ webSearch: WEB_SEARCH });
+const CHAT_SYSTEM_PROMPT_NO_SEARCH = buildChatSystemPrompt({ webSearch: false });
+// Đặt thành true nếu API từ chối công cụ tìm kiếm web (ví dụ tổ chức đã tắt tìm kiếm web
+// trong cài đặt Console); từ đó chỉ trò chuyện không tìm kiếm cho tới khi khởi động lại.
+let webSearchRejected = false;
 const CHAT_TOOLS = WEB_SEARCH
   ? [
       {
         type: "web_search_20260209",
         name: "web_search",
         max_uses: 3,
-        user_location: { type: "approximate", country: "VN", timezone: "Asia/Ho_Chi_Minh" },
+        // Không khai báo user_location: API không hỗ trợ mã quốc gia VN (trả lỗi 400).
+        // Việc ưu tiên nguồn Việt Nam được yêu cầu trong system prompt.
       },
     ]
   : undefined;
@@ -67,7 +72,7 @@ const rateLimit = createRateLimiter({ limit: RATE_LIMIT_PER_MIN, windowMs: 60_00
 const accessGuard = createAccessGuard(ACCESS_CODE);
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, model: MODEL, webSearch: WEB_SEARCH, accessCodeRequired: Boolean(ACCESS_CODE) });
+  res.json({ ok: true, model: MODEL, webSearch: WEB_SEARCH && !webSearchRejected, accessCodeRequired: Boolean(ACCESS_CODE) });
 });
 
 app.post("/api/chat", accessGuard, rateLimit, async (req, res) => {
@@ -75,11 +80,19 @@ app.post("/api/chat", accessGuard, rateLimit, async (req, res) => {
   if (!messages) {
     return res.status(400).json({ error: "Dữ liệu hội thoại không hợp lệ." });
   }
+  const useSearch = CHAT_TOOLS && !webSearchRejected;
   await streamClaude(res, {
-    system: CHAT_SYSTEM_PROMPT,
+    system: useSearch ? CHAT_SYSTEM_PROMPT : CHAT_SYSTEM_PROMPT_NO_SEARCH,
     effort: CHAT_EFFORT,
-    tools: CHAT_TOOLS,
+    tools: useSearch ? CHAT_TOOLS : undefined,
     messages: withClock(messages, req.body?.clientTime),
+    // Nếu yêu cầu có tìm kiếm web bị từ chối, thử lại một lần không kèm tìm kiếm.
+    retryWithoutTools: useSearch
+      ? () => {
+          webSearchRejected = true;
+          return { system: CHAT_SYSTEM_PROMPT_NO_SEARCH, tools: undefined };
+        }
+      : null,
   });
 });
 
@@ -119,67 +132,81 @@ app.use((req, res) => {
  * `{"text": "..."}` cho từng đoạn văn bản, `{"status": "searching"}` khi đang tìm kiếm web,
  * `{"done": true}` khi xong, `{"error": "..."}` khi có lỗi.
  */
-async function streamClaude(res, { system, effort, tools, messages }) {
+async function streamClaude(res, { system, effort, tools, messages, retryWithoutTools = null }) {
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
 
-  const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  let sentText = false;
+  const send = (payload) => {
+    if (payload.text) sentText = true;
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
 
-  let stream = null;
-  let closed = false;
+  const state = { stream: null, closed: false };
   // Người dùng huỷ (bấm dừng / đóng trang) -> ngừng sinh văn bản để tiết kiệm chi phí.
   res.on("close", () => {
-    closed = true;
-    if (!res.writableEnded) stream?.abort();
+    state.closed = true;
+    if (!res.writableEnded) state.stream?.abort();
   });
 
   try {
-    let conversation = messages;
-    for (let attempt = 0; attempt <= MAX_CONTINUATIONS && !closed; attempt++) {
-      stream = client.beta.messages.stream({
-        model: MODEL,
-        max_tokens: 64000,
-        system,
-        messages: conversation,
-        ...(tools ? { tools } : {}),
-        output_config: { effort },
-        // Nếu bộ lọc an toàn của mô hình từ chối nhầm, máy chủ Anthropic tự chạy lại
-        // trên mô hình dự phòng phù hợp thay vì trả về lời từ chối.
-        betas: ["server-side-fallback-2026-07-01"],
-        fallbacks: "default",
-      });
-
-      for await (const event of stream) {
-        if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-          send({ text: event.delta.text });
-        } else if (event.type === "content_block_start" && event.content_block.type === "server_tool_use") {
-          send({ status: "searching" });
-        }
-      }
-
-      const final = await stream.finalMessage();
-      if (final.stop_reason === "pause_turn") {
-        // Vòng tìm kiếm phía máy chủ bị tạm dừng: gửi lại nguyên lượt trả lời để Claude làm tiếp.
-        conversation = [...conversation, { role: "assistant", content: final.content }];
-        continue;
-      }
-      if (final.stop_reason === "refusal") {
-        send({ text: " Xin lỗi, tôi không thể hỗ trợ yêu cầu này." });
-      } else if (final.stop_reason === "max_tokens") {
-        send({ text: " (Câu trả lời đã bị cắt ngắn.)" });
-      }
-      break;
+    try {
+      await runConversation({ system, effort, tools, messages }, send, state);
+    } catch (error) {
+      if (!(error instanceof Anthropic.BadRequestError) || !retryWithoutTools || sentText || state.closed) throw error;
+      console.warn("[claude] Yêu cầu có tìm kiếm web bị từ chối, thử lại không tìm kiếm:", describeError(error));
+      await runConversation({ effort, messages, ...retryWithoutTools() }, send, state);
     }
     send({ done: true });
   } catch (error) {
-    if (error instanceof Anthropic.APIUserAbortError || closed) return;
+    if (error instanceof Anthropic.APIUserAbortError || state.closed) return;
     console.error("[claude]", describeError(error));
     send({ error: friendlyError(error) });
   } finally {
     if (!res.writableEnded) res.end();
+  }
+}
+
+// Một lượt trả lời, kể cả các lần tiếp tục khi tìm kiếm web bị tạm dừng (pause_turn).
+async function runConversation({ system, effort, tools, messages }, send, state) {
+  let conversation = messages;
+  for (let attempt = 0; attempt <= MAX_CONTINUATIONS && !state.closed; attempt++) {
+    state.stream = client.beta.messages.stream({
+      model: MODEL,
+      max_tokens: 64000,
+      system,
+      messages: conversation,
+      ...(tools ? { tools } : {}),
+      output_config: { effort },
+      // Nếu bộ lọc an toàn của mô hình từ chối nhầm, máy chủ Anthropic tự chạy lại
+      // trên mô hình dự phòng phù hợp thay vì trả về lời từ chối.
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",
+    });
+
+    for await (const event of state.stream) {
+      if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+        send({ text: event.delta.text });
+      } else if (event.type === "content_block_start" && event.content_block.type === "server_tool_use") {
+        send({ status: "searching" });
+      }
+    }
+
+    const final = await state.stream.finalMessage();
+    if (final.stop_reason === "pause_turn") {
+      // Vòng tìm kiếm phía máy chủ bị tạm dừng: gửi lại nguyên lượt trả lời để Claude làm tiếp.
+      conversation = [...conversation, { role: "assistant", content: final.content }];
+      continue;
+    }
+    if (final.stop_reason === "refusal") {
+      send({ text: " Xin lỗi, tôi không thể hỗ trợ yêu cầu này." });
+    } else if (final.stop_reason === "max_tokens") {
+      send({ text: " (Câu trả lời đã bị cắt ngắn.)" });
+    }
+    return;
   }
 }
 
@@ -191,7 +218,7 @@ function friendlyError(error) {
     return "Hệ thống đang quá tải. Vui lòng thử lại sau ít phút.";
   }
   if (error instanceof Anthropic.BadRequestError) {
-    return "Yêu cầu không hợp lệ. Vui lòng thử lại.";
+    return "Dịch vụ AI từ chối yêu cầu. Người quản trị hãy xem dòng bắt đầu bằng [claude] trong nhật ký máy chủ.";
   }
   if (error instanceof Anthropic.APIConnectionError) {
     return "Không kết nối được tới dịch vụ AI. Vui lòng kiểm tra mạng.";

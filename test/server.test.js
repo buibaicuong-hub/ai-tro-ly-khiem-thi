@@ -65,8 +65,10 @@ test("/api/chat stream văn bản và gửi đúng tham số tới Claude", asyn
   assert.equal(body.fallbacks, "default");
   assert.match(headers["anthropic-beta"], /server-side-fallback-2026-07-01/);
   assert.equal(body.tools[0].type, "web_search_20260209");
-  assert.equal(body.messages.at(-1).role, "system");
-  assert.match(body.messages.at(-1).content, /8 giờ sáng/);
+  assert.equal(body.tools[0].user_location, undefined); // API không hỗ trợ mã quốc gia VN
+  assert.equal(body.messages.length, 1);
+  assert.equal(body.messages[0].role, "user");
+  assert.match(body.messages[0].content.at(-1).text, /8 giờ sáng/);
 });
 
 test("/api/chat tiếp tục khi tìm kiếm web bị tạm dừng (pause_turn)", async () => {
@@ -78,6 +80,25 @@ test("/api/chat tiếp tục khi tìm kiếm web bị tạm dừng (pause_turn)"
   const second = mock.requests[1].body.messages;
   assert.equal(second.at(-1).role, "assistant");
   assert.equal(second.at(-1).content[0].type, "server_tool_use");
+});
+
+test("/api/chat thử lại không tìm kiếm web khi API từ chối công cụ", async () => {
+  const app = await startApp();
+  mock.requests.length = 0;
+  const events = await readSse(await post(app, "/api/chat", { messages: [{ role: "user", content: "NOSEARCH xin chào" }] }));
+  assert.equal(events.filter((e) => e.text).map((e) => e.text).join(""), "Xin chào. Tôi có thể giúp gì?");
+  assert.deepEqual(events.at(-1), { done: true });
+  assert.equal(mock.requests.length, 2);
+  assert.ok(mock.requests[0].body.tools);
+  assert.equal(mock.requests[1].body.tools, undefined);
+  assert.match(mock.requests[1].body.system, /không truy cập được Internet/);
+
+  // Các yêu cầu sau bỏ qua tìm kiếm luôn, không phải thử hai lần.
+  mock.requests.length = 0;
+  await (await post(app, "/api/chat", { messages: [{ role: "user", content: "chào" }] })).text();
+  assert.equal(mock.requests.length, 1);
+  assert.equal(mock.requests[0].body.tools, undefined);
+  assert.equal((await (await fetch(app + "/api/health")).json()).webSearch, false);
 });
 
 test("/api/chat từ chối lịch sử không hợp lệ", async () => {
