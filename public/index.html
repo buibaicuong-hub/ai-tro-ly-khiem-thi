@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Trợ lý Sáng Mắt</title>
+  <meta name="description" content="Trợ lý AI giọng nói tiếng Việt cho người khiếm thị: hỏi đáp bằng giọng nói và Mắt thần mô tả hình ảnh từ camera.">
+  <meta name="theme-color" content="#000000">
+  <meta name="color-scheme" content="dark">
+
+  <!-- PWA -->
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+  <link rel="icon" href="/icons/icon-192.png" sizes="192x192" type="image/png">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="Sáng Mắt">
+
+  <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body data-state="idle">
+  <a class="skip-link" href="#text-input">Bỏ qua, chuyển tới ô nhập bằng bàn phím</a>
+
+  <!-- Khung xem trước camera (chỉ hiện khi đang dùng Mắt thần, giúp người nhìn kém căn khung) -->
+  <video id="camera-preview" playsinline muted aria-hidden="true"></video>
+
+  <header class="topbar">
+    <h1 class="app-title">Trợ lý Sáng Mắt</h1>
+    <p id="status" class="status" role="status" aria-live="polite">Đang khởi động…</p>
+  </header>
+
+  <!-- Toàn màn hình là một nút lớn: chạm để nói, giữ để dùng Mắt thần -->
+  <main id="main">
+    <button id="talk" class="talk" type="button"
+            aria-describedby="talk-hint">
+      <span class="talk-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="100%" height="100%">
+          <path class="icon-mic" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/>
+        </svg>
+      </span>
+      <span id="talk-label" class="talk-label">Chạm để nói</span>
+      <span id="talk-hint" class="talk-hint">
+        Chạm một lần để nói, chạm lần nữa để dừng. Giữ lâu để chụp ảnh Mắt thần.
+        Trên máy tính: phím Cách để nói, phím C để chụp ảnh, phím Esc để dừng, phím H để nghe hướng dẫn.
+      </span>
+    </button>
+
+    <section class="transcript" aria-label="Nội dung hội thoại gần nhất">
+      <p class="line"><span class="who">Bạn:</span> <span id="user-text"></span></p>
+      <p class="line"><span class="who">Trợ lý:</span> <span id="assistant-text"></span></p>
+    </section>
+  </main>
+
+  <!-- Nhập bằng bàn phím: cho trình duyệt không hỗ trợ nhận diện giọng nói,
+       người dùng màn hình chữ nổi, hoặc dùng bàn phím đọc chính tả của iPhone -->
+  <form id="text-form" class="text-form" autocomplete="off">
+    <label for="text-input" class="visually-hidden">Nhập câu hỏi</label>
+    <input id="text-input" name="q" type="text" inputmode="text" enterkeyhint="send"
+           placeholder="Hoặc gõ câu hỏi tại đây…">
+    <button type="submit" class="send">Gửi</button>
+    <button type="button" id="camera-btn" class="send camera">Mắt thần</button>
+  </form>
+
+  <footer class="footer">
+    <a href="/privacy.html">Quyền riêng tư và lưu ý sử dụng</a>
+  </footer>
+
+  <!-- Dự phòng khi không mở được camera trực tiếp: dùng ứng dụng chụp ảnh của hệ thống -->
+  <input id="file-input" type="file" accept="image/*" capture="environment" hidden>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
