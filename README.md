@@ -9,10 +9,14 @@
 | Nhận diện giọng nói (STT) | Web Speech API, ngôn ngữ `vi-VN`, hiển thị chữ ngay khi đang nói |
 | Đọc câu trả lời (TTS) | Giọng tiếng Việt có sẵn trên thiết bị; **đọc từng câu ngay khi AI đang trả lời** (streaming) nên gần như không phải chờ |
 | Trợ lý thông minh | Claude (Anthropic) với lời nhắc chuyên biệt cho người khiếm thị: câu ngắn, không ký hiệu, ưu tiên an toàn, nhớ ngữ cảnh hội thoại |
+| Tìm kiếm web | Tự tìm trên mạng khi câu hỏi cần thông tin mới (thời tiết, tin tức, giá cả); báo "Đang tìm kiếm trên mạng" trong lúc chờ |
 | Mắt thần | Chụp ảnh camera sau → mô tả: chướng ngại vật trước, đọc chữ (nhãn thuốc, biển báo, hoá đơn), nhận mệnh giá tiền Việt Nam, vị trí theo hướng đồng hồ |
 | Âm báo & rung | Tiếng "bíp" khi bắt đầu/dừng nghe, tiếng màn trập khi chụp, âm trầm khi lỗi |
 | Lệnh nhanh (xử lý trên máy) | "trợ giúp", "nhắc lại", "nói chậm hơn", "nói nhanh hơn", "cuộc trò chuyện mới", "dừng lại" |
 | PWA | Thêm vào màn hình chính, chạy toàn màn hình, lưu đệm giao diện |
+| Giữ màn hình sáng | Dùng Wake Lock trong lúc nghe/đọc để điện thoại không tự khoá giữa chừng |
+| Xin đồng ý trước khi chụp | Lần đầu dùng Mắt thần, app đọc thông báo về việc gửi ảnh ra nước ngoài và chỉ chụp khi người dùng nói "đồng ý" (hoặc giữ màn hình lần nữa) |
+| Mã truy cập (tuỳ chọn) | Chỉ người có link kèm mã mới dùng được API, tránh phát sinh chi phí |
 
 ## Thiết kế tiếp cận (Accessibility)
 
@@ -39,20 +43,28 @@ ai-tro-ly-khiem-thi/
 ├── server.js                  # Máy chủ Express: phục vụ PWA + API /api/chat, /api/vision (stream SSE)
 ├── src/
 │   ├── prompts.js             # System prompt cho trợ lý và Mắt thần
+│   ├── validation.js          # Kiểm tra, làm sạch dữ liệu đầu vào
+│   ├── access.js              # Mã truy cập tuỳ chọn
 │   └── rate-limit.js          # Giới hạn tần suất theo IP
 ├── public/                    # Frontend PWA (HTML/CSS/JS thuần, không cần build)
 │   ├── index.html
 │   ├── manifest.webmanifest   # Khai báo PWA
 │   ├── sw.js                  # Service worker (lưu đệm giao diện)
+│   ├── privacy.html           # Quyền riêng tư và lưu ý sử dụng
 │   ├── css/styles.css         # Giao diện tương phản cao
 │   ├── js/
-│   │   ├── app.js             # Điều phối trạng thái, cử chỉ, phím tắt, lệnh giọng nói
+│   │   ├── app.js             # Điều phối trạng thái, cử chỉ, phím tắt, xin đồng ý camera
+│   │   ├── commands.js        # Nhận dạng lệnh giọng nói (trợ giúp, nhắc lại, chụp ảnh...)
+│   │   ├── wake-lock.js       # Giữ màn hình sáng
 │   │   ├── speech.js          # STT + TTS (Web Speech API), đọc theo từng câu
 │   │   ├── camera.js          # Mở camera sau, chụp và nén ảnh
 │   │   ├── api.js             # Gọi API và đọc luồng SSE
 │   │   └── sounds.js          # Âm báo, rung
 │   └── icons/                 # Biểu tượng ứng dụng (SVG + PNG)
+├── test/                      # Kiểm thử tự động (node:test, máy chủ Claude giả lập)
 ├── scripts/generate-icons.mjs # Tạo lại PNG từ SVG (tuỳ chọn)
+├── Dockerfile, render.yaml    # Triển khai
+├── .github/workflows/ci.yml   # Chạy kiểm thử trên GitHub
 ├── .env.example
 └── package.json
 ```
@@ -76,6 +88,8 @@ npm start
 
 Chế độ phát triển (tự khởi động lại khi sửa code): `npm run dev`.
 
+Kiểm thử tự động (không cần khoá API, dùng máy chủ Claude giả lập): `npm test`.
+
 ### Biến môi trường
 
 | Biến | Mặc định | Ý nghĩa |
@@ -86,13 +100,18 @@ Chế độ phát triển (tự khởi động lại khi sửa code): `npm run d
 | `CHAT_EFFORT` | `low` | Mức suy luận khi trò chuyện (`low` cho phản hồi nhanh) |
 | `VISION_EFFORT` | `medium` | Mức suy luận khi mô tả ảnh |
 | `RATE_LIMIT_PER_MIN` | `20` | Số yêu cầu tối đa / phút / IP |
+| `ENABLE_WEB_SEARCH` | `true` | Cho phép trợ lý tìm kiếm web (tính thêm phí mỗi lượt tìm) |
+| `APP_ACCESS_CODE` | (trống) | Mã truy cập; nếu đặt, chia sẻ link dạng `https://ten-mien/?code=MA` |
 
 ## Dùng trên điện thoại
 
 Camera và micro trên trình duyệt **chỉ hoạt động qua HTTPS** (hoặc `localhost`). Để thử trên điện thoại:
 
 - **Nhanh nhất**: dùng đường hầm HTTPS, ví dụ `npx localtunnel --port 3000` hoặc `cloudflared tunnel --url http://localhost:3000`, rồi mở địa chỉ `https://...` trên điện thoại.
-- **Triển khai thật**: đưa lên dịch vụ hỗ trợ Node.js (Render, Railway, Fly.io, VPS + Nginx/Caddy có chứng chỉ HTTPS). Đặt `ANTHROPIC_API_KEY` trong phần biến môi trường của dịch vụ.
+- **Triển khai thật** (khuyến nghị đặt `APP_ACCESS_CODE`):
+  - *Render.com* (có HTTPS miễn phí): Dashboard → **New → Blueprint** → chọn repo này (dùng sẵn `render.yaml`) → nhập `ANTHROPIC_API_KEY` và `APP_ACCESS_CODE`.
+  - *Docker* (VPS, Railway, Fly.io...): `docker build -t sang-mat .` rồi `docker run -p 3000:3000 --env-file .env sang-mat`, đặt sau Nginx/Caddy có chứng chỉ HTTPS.
+- **Mã truy cập**: gửi cho người dùng link `https://ten-mien/?code=MA_CUA_BAN`; app tự lưu mã và xoá khỏi thanh địa chỉ. Trên iPhone, ứng dụng đã thêm vào màn hình chính có bộ nhớ riêng với Safari — nếu app báo cần mã, gõ mã vào ô nhập rồi bấm Gửi.
 
 **Thêm vào màn hình chính**
 
@@ -132,7 +151,6 @@ Trình duyệt (PWA)                         Máy chủ Node.js                 
 
 ## Hướng phát triển
 
-- Tra cứu thông tin thời gian thực (thời tiết, tin tức) bằng công cụ tìm kiếm web của Claude.
 - Chế độ "Mắt thần liên tục" mô tả định kỳ khi di chuyển.
 - Đăng nhập, quản lý hạn mức theo người dùng; nhật ký sử dụng ẩn danh.
 - Giọng đọc chất lượng cao từ máy chủ (TTS đám mây) cho thiết bị không có giọng tiếng Việt.

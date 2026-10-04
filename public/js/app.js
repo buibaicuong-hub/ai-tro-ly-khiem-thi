@@ -4,8 +4,10 @@
 
 import { Speaker, Listener } from "./speech.js";
 import { Camera, fileToDataUrl } from "./camera.js";
-import { streamRequest, UserFacingError } from "./api.js";
+import { streamRequest, setAccessCode, UserFacingError } from "./api.js";
 import { sounds, unlockAudio } from "./sounds.js";
+import { parseCommand } from "./commands.js";
+import { ScreenWake } from "./wake-lock.js";
 
 const LONG_PRESS_MS = 700;
 const MAX_HISTORY = 20;
@@ -20,7 +22,16 @@ const HELP_TEXT =
 
 const WELCOME_TEXT =
   "Xin chào, tôi là Trợ lý Sáng Mắt. Chạm vào màn hình để hỏi tôi bất cứ điều gì, hoặc giữ ngón tay khoảng một giây để tôi nhìn giúp bạn qua camera. " +
+  "Lưu ý: câu trả lời của trí tuệ nhân tạo có thể sai, không thay thế gậy trắng, người hỗ trợ hay lời khuyên của bác sĩ. " +
   "Nói trợ giúp để nghe hướng dẫn đầy đủ.";
+
+const CONSENT_TEXT =
+  "Trước khi dùng Mắt thần lần đầu, xin bạn lưu ý. Ảnh bạn chụp sẽ được gửi tới máy chủ trí tuệ nhân tạo của công ty Anthropic ở nước ngoài để phân tích; " +
+  "máy chủ của ứng dụng này không lưu ảnh. Ảnh có thể chứa thông tin cá nhân của bạn hoặc người khác, như khuôn mặt, giấy tờ, đơn thuốc. " +
+  "Mô tả có thể sai, hãy luôn cẩn thận khi di chuyển. " +
+  "Nếu đồng ý, hãy nói đồng ý, hoặc giữ ngón tay trên màn hình lần nữa, hoặc bấm phím C. Nếu không, chỉ cần bỏ qua.";
+
+const CONSENT_WINDOW_MS = 60_000;
 
 /* ------------------------------------------------------------------ */
 
@@ -48,6 +59,9 @@ let history = loadHistory();
 let lastAnswer = "";
 let currentRequest = null; // AbortController của yêu cầu đang chạy
 let unlocked = false;
+let awaitingAccessCode = false;
+let consentAskedAt = 0; // thời điểm đã đọc thông báo xin đồng ý dùng camera
+const wake = new ScreenWake();
 
 speaker.rate = Number(store.get("rate")) || 1;
 speaker.onIdle = () => {
@@ -73,6 +87,9 @@ const LABELS = {
 function setState(next, statusText) {
   state = next;
   document.body.dataset.state = next;
+  // Giữ màn hình sáng khi đang nghe/xử lý/đọc để điện thoại không khoá giữa chừng.
+  if (next === "idle" || next === "error") wake.release();
+  else wake.acquire();
   els.label.textContent = LABELS[next];
   els.talk.setAttribute("aria-label", LABELS[next]);
   if (statusText !== undefined) setStatus(statusText);
@@ -84,6 +101,7 @@ function setStatus(text) {
 }
 
 function readyStatus() {
+  if (awaitingAccessCode) return "Cần mã truy cập: gõ mã vào ô phía dưới rồi bấm Gửi.";
   if (speaker.supported && !speaker.hasVietnameseVoice) {
     return "Sẵn sàng. Lưu ý: thiết bị chưa có giọng đọc tiếng Việt.";
   }
@@ -172,66 +190,56 @@ async function startListening() {
 
 // Định tuyến lệnh giọng nói nội bộ trước khi hỏi AI.
 function handleUtterance(text) {
-  const plain = normalize(text);
-  const short = plain.split(" ").length <= 6;
-
-  if (short && /\b(tro giup|huong dan su dung|cach su dung)\b/.test(plain)) {
-    return speak(HELP_TEXT);
+  const command = parseCommand(text, { consentPending: consentPending() });
+  switch (command.type) {
+    case "consent":
+      return describeScene("", { confirm: true });
+    case "help":
+      return speak(HELP_TEXT);
+    case "stop":
+      cancelAll();
+      return setState("idle");
+    case "repeat":
+      return repeatLast();
+    case "slower":
+      return changeRate(-0.15);
+    case "faster":
+      return changeRate(+0.15);
+    case "reset":
+      history = [];
+      saveHistory();
+      return speak("Đã bắt đầu cuộc trò chuyện mới.");
+    case "vision":
+      return describeScene(command.question);
+    default:
+      return ask(text);
   }
-  if (/^(dung|dung lai|im lang|im di|thoi|huy|huy bo)$/.test(plain)) {
-    cancelAll();
-    return setState("idle");
-  }
-  if (short && /\b(nhac lai|lap lai|noi lai)\b/.test(plain)) {
-    return repeatLast();
-  }
-  if (short && /\bnoi cham\b/.test(plain)) {
-    return changeRate(-0.15);
-  }
-  if (short && /\bnoi nhanh\b/.test(plain)) {
-    return changeRate(+0.15);
-  }
-  if (short && /\b(cuoc tro chuyen moi|xoa lich su|bat dau lai)\b/.test(plain)) {
-    history = [];
-    saveHistory();
-    return speak("Đã bắt đầu cuộc trò chuyện mới.");
-  }
-  if (VISION_PATTERN.test(plain)) {
-    const isBareCommand = short && /^(hay |vui long )?(chup( anh| hinh)?|mat than|mo camera)( giup( toi)?)?$/.test(plain);
-    return describeScene(isBareCommand ? "" : text);
-  }
-  return ask(text);
 }
 
-const VISION_PATTERN = new RegExp(
-  "\\b(" +
-    [
-      "chup( anh| hinh)?",
-      "mat than",
-      "mo camera",
-      "truoc mat",
-      "xung quanh .*co gi",
-      "nhin (giup|ho)",
-      "xem (giup|ho)",
-      "doc (giup |ho )?(chu|nhan|bien|to|hoa don|thuoc|bao bi|cai nay)",
-      "to tien",
-      "bao nhieu tien",
-      "menh gia",
-      "mau gi",
-      "(cai|thu) nay la (cai )?gi",
-      "day la (cai|thu )?gi",
-    ].join("|") +
-  ")\\b",
-);
+function consentPending() {
+  return consentAskedAt > 0 && Date.now() - consentAskedAt < CONSENT_WINDOW_MS;
+}
 
 async function ask(text) {
   pushHistory("user", text);
   await runStream("/api/chat", { messages: history }, (answer) => pushHistory("assistant", answer));
 }
 
-async function describeScene(question) {
+async function describeScene(question, { confirm = false } = {}) {
   if (unlockOnce()) return;
   cancelAll();
+
+  // Lần đầu dùng camera: đọc thông báo và chờ người dùng đồng ý rõ ràng.
+  if (!store.get("cameraConsent")) {
+    if (!confirm && !consentPending()) {
+      consentAskedAt = Date.now();
+      setState("idle", "Cần bạn đồng ý trước khi dùng Mắt thần lần đầu.");
+      return speak(CONSENT_TEXT);
+    }
+    store.set("cameraConsent", new Date().toISOString());
+    consentAskedAt = 0;
+  }
+
   setState("capturing", "Đang mở camera…");
 
   let image;
@@ -283,6 +291,12 @@ async function runStream(url, body, onComplete) {
   try {
     const answer = await streamRequest(url, body, {
       signal: controller.signal,
+      onStatus(status) {
+        if (status === "searching" && state === "thinking") {
+          setStatus("Đang tìm kiếm trên mạng…");
+          sounds.thinking();
+        }
+      },
       onText(chunk) {
         if (state === "thinking") setState("speaking", "Đang trả lời…");
         els.assistantText.textContent += chunk;
@@ -299,6 +313,13 @@ async function runStream(url, body, onComplete) {
     if (controller.signal.aborted || err?.name === "AbortError") return;
     speaker.stop();
     sounds.error();
+    if (err instanceof UserFacingError && err.status === 401) {
+      awaitingAccessCode = true;
+      setState("error", "Cần mã truy cập: gõ mã vào ô phía dưới rồi bấm Gửi.");
+      speak("Ứng dụng cần mã truy cập. Hãy gõ mã được chia sẻ cho bạn vào ô nhập ở cuối màn hình rồi bấm Gửi.");
+      els.input.focus();
+      return;
+    }
     const msg = err instanceof UserFacingError
       ? err.message
       : navigator.onLine === false
@@ -454,6 +475,11 @@ els.form.addEventListener("submit", (e) => {
   if (!text) return;
   els.input.value = "";
   cancelAll();
+  if (awaitingAccessCode) {
+    awaitingAccessCode = false;
+    setAccessCode(text);
+    return speak("Đã lưu mã truy cập. Bạn hãy hỏi lại.");
+  }
   els.userText.textContent = text;
   handleUtterance(text);
 });
@@ -494,18 +520,6 @@ document.addEventListener("visibilitychange", () => {
 /* ------------------------------------------------------------------ */
 /* Tiện ích                                                            */
 /* ------------------------------------------------------------------ */
-
-// Chữ thường, bỏ dấu tiếng Việt để so khớp lệnh ổn định hơn.
-function normalize(text) {
-  return text
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/\p{M}/gu, "")
-    .replace(/đ/g, "d")
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
 function safeStorage() {
   return {

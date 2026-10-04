@@ -1,7 +1,7 @@
 // Service worker: lưu đệm giao diện để mở nhanh và mở được khi mạng yếu.
 // Các yêu cầu /api/* luôn đi qua mạng (cần máy chủ AI).
 
-const CACHE = "sang-mat-v1";
+const CACHE = "sang-mat-v2";
 const APP_SHELL = [
   "/",
   "/index.html",
@@ -11,6 +11,9 @@ const APP_SHELL = [
   "/js/camera.js",
   "/js/api.js",
   "/js/sounds.js",
+  "/js/commands.js",
+  "/js/wake-lock.js",
+  "/privacy.html",
   "/manifest.webmanifest",
   "/icons/icon.svg",
   "/icons/icon-192.png",

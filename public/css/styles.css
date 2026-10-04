@@ -218,3 +218,28 @@ body.camera-on #camera-preview { opacity: 0.2; }
 @media (forced-colors: active) {
   .talk, .send, .text-form input { border-color: CanvasText; }
 }
+
+.footer {
+  padding: 0 var(--gutter) 16px;
+  text-align: center;
+  position: relative;
+  z-index: 1;
+}
+.footer a {
+  color: var(--accent);
+  font-size: 0.85em;
+  display: inline-block;
+  padding: 10px 4px; /* vùng chạm đủ lớn */
+}
+
+/* Trang văn bản (quyền riêng tư) */
+.doc {
+  max-width: 44em;
+  margin: 0 auto;
+  padding: 16px var(--gutter) 48px;
+  -webkit-user-select: text;
+  user-select: text;
+}
+.doc h1, .doc h2 { color: var(--accent); line-height: 1.25; }
+.doc a { color: var(--accent); }
+.doc li { margin: 6px 0; }

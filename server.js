@@ -9,8 +9,10 @@ import express from "express";
 import Anthropic from "@anthropic-ai/sdk";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { CHAT_SYSTEM_PROMPT, VISION_SYSTEM_PROMPT, DEFAULT_VISION_QUESTION } from "./src/prompts.js";
+import { buildChatSystemPrompt, VISION_SYSTEM_PROMPT, DEFAULT_VISION_QUESTION } from "./src/prompts.js";
 import { createRateLimiter } from "./src/rate-limit.js";
+import { createAccessGuard } from "./src/access.js";
+import { cleanText, parseDataUrl, sanitizeHistory, withClock } from "./src/validation.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -19,11 +21,21 @@ const MODEL = process.env.CLAUDE_MODEL || "claude-opus-5-5";
 const CHAT_EFFORT = process.env.CHAT_EFFORT || "low";
 const VISION_EFFORT = process.env.VISION_EFFORT || "medium";
 const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN) || 20;
+const WEB_SEARCH = process.env.ENABLE_WEB_SEARCH !== "false";
+const ACCESS_CODE = process.env.APP_ACCESS_CODE || "";
+const MAX_CONTINUATIONS = 3; // số lần tiếp tục tối đa khi tìm kiếm web bị tạm dừng (pause_turn)
 
-const MAX_HISTORY_MESSAGES = 20;
-const MAX_TEXT_CHARS = 4000;
-const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // giới hạn ảnh của Claude API
-const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+const CHAT_SYSTEM_PROMPT = buildChatSystemPrompt({ webSearch: WEB_SEARCH });
+const CHAT_TOOLS = WEB_SEARCH
+  ? [
+      {
+        type: "web_search_20260209",
+        name: "web_search",
+        max_uses: 3,
+        user_location: { type: "approximate", country: "VN", timezone: "Asia/Ho_Chi_Minh" },
+      },
+    ]
+  : undefined;
 
 // Đọc thông tin xác thực từ môi trường (ANTHROPIC_API_KEY hoặc hồ sơ `ant auth login`).
 const client = new Anthropic();
@@ -52,12 +64,13 @@ app.use(
 );
 
 const rateLimit = createRateLimiter({ limit: RATE_LIMIT_PER_MIN, windowMs: 60_000 });
+const accessGuard = createAccessGuard(ACCESS_CODE);
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, model: MODEL });
+  res.json({ ok: true, model: MODEL, webSearch: WEB_SEARCH, accessCodeRequired: Boolean(ACCESS_CODE) });
 });
 
-app.post("/api/chat", rateLimit, async (req, res) => {
+app.post("/api/chat", accessGuard, rateLimit, async (req, res) => {
   const messages = sanitizeHistory(req.body?.messages);
   if (!messages) {
     return res.status(400).json({ error: "Dữ liệu hội thoại không hợp lệ." });
@@ -65,11 +78,12 @@ app.post("/api/chat", rateLimit, async (req, res) => {
   await streamClaude(res, {
     system: CHAT_SYSTEM_PROMPT,
     effort: CHAT_EFFORT,
+    tools: CHAT_TOOLS,
     messages: withClock(messages, req.body?.clientTime),
   });
 });
 
-app.post("/api/vision", rateLimit, async (req, res) => {
+app.post("/api/vision", accessGuard, rateLimit, async (req, res) => {
   const image = parseDataUrl(req.body?.image);
   if (!image) {
     return res.status(400).json({ error: "Ảnh không hợp lệ hoặc quá lớn (tối đa 5 MB)." });
@@ -91,17 +105,21 @@ app.post("/api/vision", rateLimit, async (req, res) => {
   });
 });
 
+app.use("/api", (req, res) => {
+  res.status(404).json({ error: "Không tìm thấy." });
+});
+
 // Mọi đường dẫn khác trả về trang chính (để PWA mở được từ bất kỳ URL nào).
 app.use((req, res) => {
   res.sendFile(path.join(here, "public", "index.html"));
 });
 
 /**
- * Gọi Claude ở chế độ stream và chuyển tiếp văn bản về trình duyệt dưới dạng
- * Server-Sent Events: `data: {"text": "..."}` cho từng đoạn, `data: {"done": true}` khi xong,
- * `data: {"error": "..."}` khi có lỗi.
+ * Gọi Claude ở chế độ stream và chuyển tiếp về trình duyệt dưới dạng Server-Sent Events:
+ * `{"text": "..."}` cho từng đoạn văn bản, `{"status": "searching"}` khi đang tìm kiếm web,
+ * `{"done": true}` khi xong, `{"error": "..."}` khi có lỗi.
  */
-async function streamClaude(res, { system, effort, messages }) {
+async function streamClaude(res, { system, effort, tools, messages }) {
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
@@ -110,86 +128,59 @@ async function streamClaude(res, { system, effort, messages }) {
 
   const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
-  const stream = client.beta.messages.stream({
-    model: MODEL,
-    max_tokens: 64000,
-    system,
-    messages,
-    output_config: { effort },
-    // Nếu bộ lọc an toàn của mô hình từ chối nhầm, máy chủ Anthropic tự chạy lại
-    // trên mô hình dự phòng phù hợp thay vì trả về lời từ chối.
-    betas: ["server-side-fallback-2026-07-01"],
-    fallbacks: "default",
-  });
-
+  let stream = null;
+  let closed = false;
   // Người dùng huỷ (bấm dừng / đóng trang) -> ngừng sinh văn bản để tiết kiệm chi phí.
   res.on("close", () => {
-    if (!res.writableEnded) stream.abort();
+    closed = true;
+    if (!res.writableEnded) stream?.abort();
   });
 
   try {
-    for await (const event of stream) {
-      if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-        send({ text: event.delta.text });
+    let conversation = messages;
+    for (let attempt = 0; attempt <= MAX_CONTINUATIONS && !closed; attempt++) {
+      stream = client.beta.messages.stream({
+        model: MODEL,
+        max_tokens: 64000,
+        system,
+        messages: conversation,
+        ...(tools ? { tools } : {}),
+        output_config: { effort },
+        // Nếu bộ lọc an toàn của mô hình từ chối nhầm, máy chủ Anthropic tự chạy lại
+        // trên mô hình dự phòng phù hợp thay vì trả về lời từ chối.
+        betas: ["server-side-fallback-2026-07-01"],
+        fallbacks: "default",
+      });
+
+      for await (const event of stream) {
+        if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+          send({ text: event.delta.text });
+        } else if (event.type === "content_block_start" && event.content_block.type === "server_tool_use") {
+          send({ status: "searching" });
+        }
       }
-    }
-    const final = await stream.finalMessage();
-    if (final.stop_reason === "refusal") {
-      send({ text: " Xin lỗi, tôi không thể hỗ trợ yêu cầu này." });
-    } else if (final.stop_reason === "max_tokens") {
-      send({ text: " (Câu trả lời đã bị cắt ngắn.)" });
+
+      const final = await stream.finalMessage();
+      if (final.stop_reason === "pause_turn") {
+        // Vòng tìm kiếm phía máy chủ bị tạm dừng: gửi lại nguyên lượt trả lời để Claude làm tiếp.
+        conversation = [...conversation, { role: "assistant", content: final.content }];
+        continue;
+      }
+      if (final.stop_reason === "refusal") {
+        send({ text: " Xin lỗi, tôi không thể hỗ trợ yêu cầu này." });
+      } else if (final.stop_reason === "max_tokens") {
+        send({ text: " (Câu trả lời đã bị cắt ngắn.)" });
+      }
+      break;
     }
     send({ done: true });
   } catch (error) {
-    if (error instanceof Anthropic.APIUserAbortError) return;
+    if (error instanceof Anthropic.APIUserAbortError || closed) return;
     console.error("[claude]", describeError(error));
     send({ error: friendlyError(error) });
   } finally {
     if (!res.writableEnded) res.end();
   }
-}
-
-function sanitizeHistory(raw) {
-  if (!Array.isArray(raw) || raw.length === 0) return null;
-  const messages = [];
-  for (const item of raw.slice(-MAX_HISTORY_MESSAGES)) {
-    const role = item?.role;
-    const text = cleanText(item?.content);
-    if ((role !== "user" && role !== "assistant") || !text) continue;
-    // Gộp các lượt liên tiếp cùng vai trò để đảm bảo hội thoại xen kẽ hợp lệ.
-    const last = messages[messages.length - 1];
-    if (last && last.role === role) {
-      last.content += `\n${text}`;
-    } else {
-      messages.push({ role, content: text });
-    }
-  }
-  while (messages.length && messages[0].role !== "user") messages.shift();
-  if (!messages.length || messages[messages.length - 1].role !== "user") return null;
-  return messages;
-}
-
-// Thêm giờ địa phương của người dùng bằng một system message ở cuối hội thoại
-// (không sửa system prompt cố định để giữ nguyên bộ nhớ đệm prompt).
-function withClock(messages, clientTime) {
-  const time = cleanText(clientTime)?.slice(0, 100);
-  if (!time) return messages;
-  return [...messages, { role: "system", content: `Thời gian hiện tại trên thiết bị người dùng: ${time}.` }];
-}
-
-function cleanText(value) {
-  if (typeof value !== "string") return null;
-  const text = value.trim().slice(0, MAX_TEXT_CHARS);
-  return text || null;
-}
-
-function parseDataUrl(value) {
-  if (typeof value !== "string") return null;
-  const match = /^data:(image\/[a-z+]+);base64,([A-Za-z0-9+/=]+)$/.exec(value);
-  if (!match || !ALLOWED_IMAGE_TYPES.has(match[1])) return null;
-  const approxBytes = Math.floor((match[2].length * 3) / 4);
-  if (approxBytes > MAX_IMAGE_BYTES) return null;
-  return { mediaType: match[1], data: match[2] };
 }
 
 function friendlyError(error) {
@@ -218,4 +209,8 @@ function describeError(error) {
 
 app.listen(PORT, () => {
   console.log(`Trợ lý AI khiếm thị đang chạy tại http://localhost:${PORT} (mô hình: ${MODEL})`);
+  console.log(`Tìm kiếm web: ${WEB_SEARCH ? "bật" : "tắt"} · Mã truy cập: ${ACCESS_CODE ? "bật" : "tắt"}`);
+  if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
+    console.warn("Cảnh báo: chưa đặt ANTHROPIC_API_KEY trong .env — các yêu cầu tới AI sẽ thất bại.");
+  }
 });
